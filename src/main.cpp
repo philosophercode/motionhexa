@@ -50,6 +50,13 @@ AudioInputPDM audioInput(PDM_DATA, PDM_CLK, (HARDWARE_VERSION >= 4));
 FFTProcessing fftProcessing(audioInput, 10, 128);
 
 #include "patterns.h"
+#include "patterns/asher.h"
+#include "patterns/window.h"
+#include "patterns/liquidlight.h"
+#include "patterns/fireflies.h"
+#include "patterns/elementgarden.h"
+#include "patterns/impossibleobject.h"
+#include "patterns/fieldscope.h"
 
 IndexedPatternRunner *indexedRunner; // main pattern runner
 std::shared_ptr<PatternRunner> powerOnOffRunner;
@@ -290,6 +297,8 @@ void setup() {
   FastLED.delay(10);
 #endif
 
+  patternManager.registerPattern<AsherShow>();
+  patternManager.registerPattern<IsaacLetters>();
   patternManager.registerPattern<MotionHexa>();
   patternManager.registerPattern<TriBounce>();
   patternManager.registerPattern<PixelDust>();
@@ -301,7 +310,14 @@ void setup() {
   patternManager.registerPattern<SparkleDroplets>();
   patternManager.registerPattern<BlobDroplets>();
   patternManager.registerPattern<SoundBits>();
-  
+  patternManager.registerPattern<CompassNeedle>();
+  patternManager.registerPattern<TheWindow>();
+  patternManager.registerPattern<LiquidLight>();
+  patternManager.registerPattern<FireflySynchrony>();
+  patternManager.registerPattern<ElementGarden>();
+  patternManager.registerPattern<ImpossibleObject>();
+  patternManager.registerPattern<FieldScope>();
+
 #if HARDWARE_VERSION >= 3
   patternManager.registerPattern<ChargingPattern>(1);
   auto chargingRunner = patternManager.setupConditionalRunner<ChargingPattern>([](PatternRunner &runner) -> uint8_t {

@@ -980,6 +980,107 @@ public:
 
 /* ------------------------------------------------------------------------------- */
 
+class CompassNeedle : public Pattern {
+  // Rotate vector v by quaternion q: v' = v + 2w*(q×v) + 2*(q×(q×v))
+  static vectorf quatRotate(const Quaternion &q, vectorf v) {
+    float tx = 2.0f * (q.y * v.z - q.z * v.y);
+    float ty = 2.0f * (q.z * v.x - q.x * v.z);
+    float tz = 2.0f * (q.x * v.y - q.y * v.x);
+    return vectorf(
+      v.x + q.w * tx + (q.y * tz - q.z * ty),
+      v.y + q.w * ty + (q.z * tx - q.x * tz),
+      v.z + q.w * tz + (q.x * ty - q.y * tx)
+    );
+  }
+
+  // World-frame magnetic north unit vector, expressed in the post-localizeMotionFrame body axes.
+  // After localize (HARDWARE_VERSION>1): panel-right=x, panel-up=y, panel-out=z.
+  // Starting guess: north = +Y (panel-up when flat facing north).
+  // These signs may need empirical flips after on-device testing.
+  static constexpr float kNorthX = 0.0f;
+  static constexpr float kNorthY = 1.0f;
+  static constexpr float kNorthZ = 0.0f;
+
+  static constexpr float kSmoothAlpha = 0.15f;  // EMA weight for new sample
+  static constexpr float kDimThreshold = 0.15f; // projected magnitude below this dims the needle
+
+  vectorf smoothDir{0.0f, 1.0f, 0.0f}; // smoothed body-frame projected direction (x,y)
+  bool initialized = false;
+
+public:
+  void update() {
+    ctx.leds.fill_solid(CRGB::Black);
+
+    Quaternion q = MotionManager::motionFrame.quat;
+
+    // Rotate world north into body/panel frame using the quaternion conjugate (q* = {w,-x,-y,-z})
+    Quaternion qConj = {q.w, -q.x, -q.y, -q.z};
+    vectorf north(kNorthX, kNorthY, kNorthZ);
+    vectorf bodyNorth = quatRotate(qConj, north);
+
+    // Project onto panel plane (x,y); ignore z
+    float px = bodyNorth.x;
+    float py = bodyNorth.y;
+    float projMag = sqrtf(px * px + py * py);
+
+    // Smooth the 2D direction vector to avoid 359->0 wrap glitches
+    if (!initialized) {
+      smoothDir.x = (projMag > 0.01f ? px / projMag : 0.0f);
+      smoothDir.y = (projMag > 0.01f ? py / projMag : 1.0f);
+      initialized = true;
+    } else if (projMag > kDimThreshold) {
+      float nx = px / projMag;
+      float ny = py / projMag;
+      smoothDir.x += (nx - smoothDir.x) * kSmoothAlpha;
+      smoothDir.y += (ny - smoothDir.y) * kSmoothAlpha;
+      // renormalize
+      float len = sqrtf(smoothDir.x * smoothDir.x + smoothDir.y * smoothDir.y);
+      if (len > 0.001f) {
+        smoothDir.x /= len;
+        smoothDir.y /= len;
+      }
+    }
+    // if projMag <= kDimThreshold, keep last smoothDir but dim the needle
+
+    // brightness scale: fade when panel is face-on to north (projected vector small)
+    uint8_t dimScale = (uint8_t)constrain(projMag / kDimThreshold * 255.0f, 0.0f, 255.0f);
+
+    // Map panel-plane direction (dx,dy) into axial space.
+    // Consistent with Example 3: rectToHex(v.y, -v.x) maps panel-up(+y) to "up" on display.
+    fAxial centerAx = fAxial(axial.axialFromPixelIndex(LED_COUNT / 2));
+
+    const float kNorthLen = 9.0f;  // hex cells from center to north tip
+    const float kSouthLen = 5.5f;  // hex cells from center to south tail
+
+    vectorf northPt(smoothDir.y * kNorthLen, -smoothDir.x * kNorthLen);
+    vectorf southPt(-smoothDir.y * kSouthLen, smoothDir.x * kSouthLen);
+
+    fAxial northAx = axial.rectToHex(northPt, 1.0f);
+    fAxial southAx = axial.rectToHex(southPt, 1.0f);
+
+    fAxial northEnd(centerAx.q() + northAx.q(), centerAx.r() + northAx.r());
+    fAxial southEnd(centerAx.q() + southAx.q(), centerAx.r() + southAx.r());
+
+    // North half: center -> tip, dim at center, full red at tip
+    hexline(ctx, centerAx, northEnd, [dimScale](uint8_t progress) {
+      uint8_t v = scale8(progress, dimScale);
+      return CRGB(v, 0, 0);
+    });
+
+    // South tail: center -> tail, faint grey, brightest at tip
+    hexline(ctx, centerAx, southEnd, [dimScale](uint8_t progress) {
+      uint8_t v = scale8(scale8(progress, 60), dimScale);
+      return CRGB(v, v, v);
+    });
+  }
+
+  const char *description() {
+    return "CompassNeedle";
+  }
+};
+
+/* ------------------------------------------------------------------------------- */
+
 class ChargingPattern : public Pattern {
 public:
   int lastStateOfCharge = 0;
@@ -1091,6 +1192,286 @@ public:
     return (animatingPowerOn ? "PowerOn" : "PowerOff");
   }
 };
+
+/* ------------------------------------------------------------------------------- */
+
+// Orientation flip constants — if letters appear upside-down or mirrored on device, toggle these.
+static constexpr bool kIsaacFlipX = false; // flip left-right
+static constexpr bool kIsaacFlipY = false; // flip up-down (try true if letters are upside-down)
+
+class IsaacLetters : public Pattern {
+  // 5×7 uppercase bitmap font, columns left-to-right, rows top-to-bottom
+  // each uint8_t is one row, bit 4 = leftmost column (0x10), bit 0 = rightmost
+  static const uint8_t kFontI[7];
+  static const uint8_t kFontS[7];
+  static const uint8_t kFontA[7];
+  static const uint8_t kFontC[7];
+
+  // letter sequence: I, S, A, A, C (5 stages)
+  static constexpr int kStageCount = 5;
+  static const uint8_t * const kLetterFont[kStageCount];
+  // vivid hues, evenly spaced
+  static const uint8_t kLetterHue[kStageCount];
+
+  // cached target pixel sets per stage (computed once per pattern start)
+  vector<PixelIndex> letterPixels[kStageCount];
+  bool pixelsCached = false;
+
+  // physics for DISSOLVE
+  PixelPhysics<LED_COUNT> *physics = nullptr;
+  CRGB particleColor;
+
+  enum class Stage { FORM, HOLD, DISSOLVE, GATHER };
+  Stage stage = Stage::HOLD;
+  int stageIndex = 0;      // 0..4 = I,S,A,A,C
+  unsigned long stageStart = 0;
+
+  static constexpr unsigned long kFormMs    =  600;
+  static constexpr unsigned long kHoldMs    = 1500;
+  static constexpr unsigned long kDissolveMs= 5000;
+  static constexpr unsigned long kGatherMs  =  800;
+
+  // Compute the target pixels for every letter and cache them.
+  void buildPixelCache() {
+    if (pixelsCached) return;
+
+    // Panel positions are in micrometers. kMeridian=19 rows, spacing=3.9mm.
+    // Row height in um: spacing * sqrt(3) ≈ 3900 * 1.7321 ≈ 6755 um
+    // Panel half-height (9 rows of vertical steps) ≈ 9 * 6755/2 * ... use bounding box approach.
+    // Measure actual extent: max |y| across all pixels ≈ 9 * 3900 * sqrt(3)/2 ≈ 30396 um
+    // Letters should be 65% of panel height = 0.65 * 2 * 30396 ≈ 39515 um tall
+    // Font is 7 rows tall → cell height = 39515/7 ≈ 5645 um
+    // Font is 5 cols wide → cell width = same (square cells for simplicity)
+    const float cellH = 5600.0f;  // um per font row
+    const float cellW = 5600.0f;  // um per font col
+    const float fontH = 7 * cellH;
+    const float fontW = 5 * cellW;
+
+    for (int si = 0; si < kStageCount; ++si) {
+      letterPixels[si].clear();
+      const uint8_t *font = kLetterFont[si];
+      for (PixelIndex px = 0; px < LED_COUNT; ++px) {
+        UMPoint p = hexGrid.position(px);
+        float rx = kIsaacFlipX ? -p.x : p.x;
+        float ry = kIsaacFlipY ? -p.y :  p.y;
+        // map rect position to font grid: center font on panel
+        float fx = (rx + fontW * 0.5f) / cellW;   // 0..5
+        float fy = (fontH * 0.5f - ry) / cellH;   // 0..7 (y flipped: panel up = font top)
+        int col = (int)fx;
+        int row = (int)fy;
+        // nearest-cell sample
+        if (col >= 0 && col < 5 && row >= 0 && row < 7) {
+          if (font[row] & (0x10 >> col)) {
+            letterPixels[si].push_back(px);
+          }
+        }
+        // thickening: also light pixels whose center is within 0.55 cells of any lit bitmap cell
+        // (handles sparse sampling on hex lattice)
+        if (col >= -1 && col <= 5 && row >= -1 && row <= 7) {
+          bool nearLit = false;
+          for (int dr = -1; dr <= 1 && !nearLit; ++dr) {
+            for (int dc = -1; dc <= 1 && !nearLit; ++dc) {
+              int nr = row + dr, nc = col + dc;
+              if (nr >= 0 && nr < 7 && nc >= 0 && nc < 5) {
+                if (font[nr] & (0x10 >> nc)) {
+                  // distance from pixel center to nearest point of this cell
+                  float cx = (nc + 0.5f) * cellW - fontW * 0.5f;
+                  float cy = fontH * 0.5f - (nr + 0.5f) * cellH;
+                  float dist = sqrtf((rx-cx)*(rx-cx) + (ry-cy)*(ry-cy));
+                  if (dist < cellW * 0.55f) nearLit = true;
+                }
+              }
+            }
+          }
+          if (nearLit) {
+            // avoid duplicates
+            bool found = false;
+            for (PixelIndex already : letterPixels[si]) {
+              if (already == px) { found = true; break; }
+            }
+            if (!found) letterPixels[si].push_back(px);
+          }
+        }
+      }
+    }
+    pixelsCached = true;
+  }
+
+  void startPhysics(int si) {
+    if (physics) { delete physics; physics = nullptr; }
+    const auto &pxList = letterPixels[si];
+    if (pxList.empty()) return;
+    // create physics with 0 particles, then place them at letter pixel positions
+    physics = new PixelPhysics<LED_COUNT>(hexGrid, 0, 70, 0xF4);
+    for (PixelIndex px : pxList) {
+      if (physics->particles.size() < LED_COUNT) {
+        physics->addParticle(px);
+        // small random initial velocity
+        auto &p = *physics->particles.back();
+        p.velocity = vector16(random8()-128, random8()-128);
+        p.velocity = p.velocity.scale8(30);
+      }
+    }
+    particleColor = CHSV(kLetterHue[si], 0xFF, 0xFF);
+  }
+
+  void stopPhysics() {
+    if (physics) { delete physics; physics = nullptr; }
+  }
+
+  unsigned long stageElapsed() {
+    return millis() - stageStart;
+  }
+
+  void enterStage(Stage s) {
+    stage = s;
+    stageStart = millis();
+  }
+
+public:
+  IsaacLetters() { }
+
+  ~IsaacLetters() {
+    stopPhysics();
+  }
+
+  void setup() override {
+    pixelsCached = false;
+    stageIndex = 0;
+    buildPixelCache();
+    enterStage(Stage::FORM);
+  }
+
+  void update() override {
+    unsigned long elapsed = stageElapsed();
+    ctx.leds.fill_solid(CRGB::Black);
+
+    CRGB letterColor = CHSV(kLetterHue[stageIndex], 0xFF, 0xFF);
+    const auto &curPixels = letterPixels[stageIndex];
+
+    switch (stage) {
+      case Stage::FORM: {
+        // fade in letter
+        uint8_t bright = (uint8_t)constrain(0xFF * (long)elapsed / kFormMs, 0, 0xFF);
+        for (PixelIndex px : curPixels) {
+          ctx.leds[px] = letterColor.scale8(bright);
+        }
+        if (elapsed >= kFormMs) {
+          enterStage(Stage::HOLD);
+        }
+        break;
+      }
+
+      case Stage::HOLD: {
+        for (PixelIndex px : curPixels) {
+          ctx.leds[px] = letterColor;
+        }
+        if (elapsed >= kHoldMs) {
+          startPhysics(stageIndex);
+          enterStage(Stage::DISSOLVE);
+        }
+        break;
+      }
+
+      case Stage::DISSOLVE: {
+        if (physics) {
+          physics->update([](PixelIndex index) {
+            return accelerationAtPixelIndex(index, MotionManager::motionFrame.agmt);
+          });
+          for (auto *p : physics->particles) {
+            ctx.leds[p->index] = particleColor;
+          }
+        }
+        if (elapsed >= kDissolveMs) {
+          stopPhysics();
+          // advance to next letter
+          stageIndex = (stageIndex + 1) % kStageCount;
+          enterStage(Stage::GATHER);
+        }
+        break;
+      }
+
+      case Stage::GATHER: {
+        // crossfade: fade in next letter (particles already gone)
+        CRGB nextColor = CHSV(kLetterHue[stageIndex], 0xFF, 0xFF);
+        const auto &nextPixels = letterPixels[stageIndex];
+        uint8_t bright = (uint8_t)constrain(0xFF * (long)elapsed / kGatherMs, 0, 0xFF);
+        for (PixelIndex px : nextPixels) {
+          ctx.leds[px] = nextColor.scale8(bright);
+        }
+        if (elapsed >= kGatherMs) {
+          enterStage(Stage::HOLD);
+        }
+        break;
+      }
+    }
+  }
+
+  const char *description() override {
+    return "IsaacLetters";
+  }
+};
+
+// 5×7 font definitions — bit 4 = leftmost, bit 0 = rightmost
+// I
+const uint8_t IsaacLetters::kFontI[7] = {
+  0b11111,  // #####
+  0b00100,  // ..#..
+  0b00100,  // ..#..
+  0b00100,  // ..#..
+  0b00100,  // ..#..
+  0b00100,  // ..#..
+  0b11111,  // #####
+};
+// S
+const uint8_t IsaacLetters::kFontS[7] = {
+  0b01111,  // .####
+  0b10000,  // #....
+  0b10000,  // #....
+  0b01110,  // .###.
+  0b00001,  // ....#
+  0b00001,  // ....#
+  0b11110,  // ####.
+};
+// A
+const uint8_t IsaacLetters::kFontA[7] = {
+  0b00100,  // ..#..
+  0b01010,  // .#.#.
+  0b10001,  // #...#
+  0b10001,  // #...#
+  0b11111,  // #####
+  0b10001,  // #...#
+  0b10001,  // #...#
+};
+// C
+const uint8_t IsaacLetters::kFontC[7] = {
+  0b01111,  // .####
+  0b10000,  // #....
+  0b10000,  // #....
+  0b10000,  // #....
+  0b10000,  // #....
+  0b10000,  // #....
+  0b01111,  // .####
+};
+
+const uint8_t * const IsaacLetters::kLetterFont[IsaacLetters::kStageCount] = {
+  IsaacLetters::kFontI,
+  IsaacLetters::kFontS,
+  IsaacLetters::kFontA,
+  IsaacLetters::kFontA,
+  IsaacLetters::kFontC,
+};
+
+// hues: yellow, cyan, magenta, green, orange — vivid and distinct
+const uint8_t IsaacLetters::kLetterHue[IsaacLetters::kStageCount] = {
+  64,   // I: yellow
+  128,  // S: cyan
+  192,  // A: magenta/purple
+  96,   // A: chartreuse
+  16,   // C: orange
+};
+
+/* ------------------------------------------------------------------------------- */
 
 class BlinkIdentifyPattern : public Pattern {
   const int blinkTime = 900;
